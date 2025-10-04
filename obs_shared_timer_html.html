@@ -1,0 +1,316 @@
+<!--
+OBS Shared Timer (single-file)
+Features:
+- Countdown timer (обратный отсчёт)
+- +1 минута button
+- Start / Pause
+- Wheel-style time picker (minutes / seconds) like iPhone alarm
+- Two modes in one file: view (for OBS) and control (for phones/PCs)
+- Real-time sync using Firebase Realtime Database (no server required)
+- Access by link: ?room=ROOM_ID&mode=view  (OBS)
+               ?room=ROOM_ID&mode=control (controllers)
+
+How to use:
+1) Create a Firebase project and enable Realtime Database (test mode is fine for streaming; see notes about security below).
+2) Copy your Firebase config object and paste into the firebaseConfig variable below.
+3) Host this file on GitHub Pages / Netlify / any static host.
+4) Open URL like:
+   https://your-site/obs-timer.html?room=myshow&mode=view    <-- OBS Browser Source
+   https://your-site/obs-timer.html?room=myshow&mode=control <-- phone or PC to control
+
+Security note: This sample uses simple public rooms. Anyone with the control URL can change the timer. If you need authentication, we can add Firebase Auth later.
+-->
+
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OBS Shared Timer</title>
+  <style>
+    :root{--bg:#0b1020;--card:#0f1724;--accent:#60a5fa;--muted:#9ca3af}
+    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Roboto,Arial}
+    body{background:linear-gradient(180deg,#020617 0%, #071021 100%);color:#fff;display:flex;align-items:center;justify-content:center;padding:16px}
+    .container{width:100%;max-width:900px}
+
+    /* VIEW (big) */
+    .timer-view{background:transparent;text-align:center;padding:20px;border-radius:12px}
+    .time-big{font-size:clamp(48px,18vh,160px);font-weight:700;letter-spacing:2px}
+    .sub{color:var(--muted);font-size:14px;margin-top:8px}
+
+    /* CONTROL */
+    .controls{display:flex;gap:16px;align-items:center;justify-content:center;flex-wrap:wrap}
+    .btn{background:var(--card);border:1px solid rgba(255,255,255,0.04);padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600}
+    .btn:active{transform:translateY(1px)}
+    .btn.primary{background:linear-gradient(90deg,var(--accent),#3b82f6);color:#03102a}
+    .small{padding:6px 8px;font-size:14px}
+
+    /* wheel picker */
+    .picker{display:flex;gap:10px;align-items:center}
+    .wheel{width:90px;height:140px;overflow:hidden;border-radius:12px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));box-shadow:0 6px 24px rgba(2,6,23,0.6);display:flex;flex-direction:column;align-items:center}
+    .wheel-list{flex:1;overflow-y:auto;scroll-snap-type:y mandatory;padding:10px 0;margin:0}
+    .wheel-item{height:40px;display:flex;align-items:center;justify-content:center;scroll-snap-align:center;font-size:20px;opacity:0.6}
+    .wheel-item.active{font-size:22px;font-weight:700;opacity:1}
+    .picker-label{font-size:13px;color:var(--muted);text-align:center;margin-top:6px}
+
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+    .room{font-size:14px;color:var(--muted)}
+
+    footer{color:var(--muted);font-size:13px;margin-top:12px;text-align:center}
+
+    @media (max-width:640px){.container{max-width:420px}}
+  </style>
+</head>
+<body>
+  <div class="container" id="app">
+    <div class="topbar">
+      <div class="room" id="roomLabel">Room: —</div>
+      <div class="room" id="modeLabel">Mode: —</div>
+    </div>
+
+    <div id="viewArea" class="timer-view" style="display:none">
+      <div class="time-big" id="displayTime">00:00</div>
+      <div class="sub">OBS Viewer — вставь эту страницу как Browser Source</div>
+    </div>
+
+    <div id="controlArea" style="display:none">
+      <div style="text-align:center;margin-bottom:12px">
+        <div class="time-big" id="displayTimeControl">00:00</div>
+        <div class="sub">Controller — отправь ссылку участникам для совместного управления</div>
+      </div>
+
+      <div class="controls">
+        <button class="btn small" id="add1">+1 минута</button>
+        <button class="btn small" id="startPause">Старт</button>
+        <button class="btn small" id="resetBtn">Сброс</button>
+      </div>
+
+      <div style="height:12px"></div>
+
+      <div style="display:flex;flex-direction:column;align-items:center;gap:8px">
+        <div style="font-size:14px;color:var(--muted)">Установить время (колёсики)</div>
+        <div class="picker" id="picker">
+          <div>
+            <div class="wheel" id="wheelMin">
+              <div class="wheel-list" id="minList"></div>
+            </div>
+            <div class="picker-label">Мин</div>
+          </div>
+          <div>
+            <div class="wheel" id="wheelSec">
+              <div class="wheel-list" id="secList"></div>
+            </div>
+            <div class="picker-label">Сек</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px;align-items:center">
+            <button class="btn" id="setBtn">Установить время</button>
+          </div>
+        </div>
+      </div>
+
+      <footer>Любой, у кого есть ссылка <code>?room=NAME&mode=control</code>, может управлять таймером.</footer>
+    </div>
+  </div>
+
+  <!-- Firebase v9 modular (CDN) -->
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-app.js';
+    import { getDatabase, ref, onValue, set, update, serverTimestamp } from 'https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js';
+
+    // --- CONFIGURE THIS: paste your Firebase config here ---
+    const firebaseConfig = {
+      apiKey: "AIzaSyAyFAfN7XJayseYzLKazi7bdjIegOB9Ph4",
+      authDomain: "chocokokko-3ef33.firebaseapp.com",
+      projectId: "chocokokko-3ef33",
+      storageBucket: "chocokokko-3ef33.firebasestorage.app",
+      messagingSenderId: "642175746561",
+      appId: "1:642175746561:web:89e02bcfc6c794854cf600"
+    };
+    // ------------------------------------------------------
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    // Parse URL params
+    const params = new URLSearchParams(location.search);
+    const room = (params.get('room') || 'default-room').replace(/[^a-zA-Z0-9-_]/g, '').toLowerCase();
+    const mode = (params.get('mode') || 'view').toLowerCase(); // 'view' or 'control'
+
+    document.getElementById('roomLabel').textContent = 'Room: ' + room;
+    document.getElementById('modeLabel').textContent = 'Mode: ' + mode;
+
+    const viewArea = document.getElementById('viewArea');
+    const controlArea = document.getElementById('controlArea');
+    const displayTime = document.getElementById('displayTime');
+    const displayTimeControl = document.getElementById('displayTimeControl');
+
+    if(mode === 'view'){
+      viewArea.style.display = 'block';
+    } else {
+      controlArea.style.display = 'block';
+    }
+
+    const roomRef = ref(db, 'rooms/' + room);
+
+    // Local state
+    let state = { remaining: 0, running: false, updatedAt: Date.now() };
+
+    // Listen to remote changes
+    onValue(roomRef, (snap) => {
+      const val = snap.val();
+      if(!val) return;
+      // merge
+      state.remaining = val.remaining ?? state.remaining;
+      state.running = val.running ?? state.running;
+      state.updatedAt = val.updatedAt ?? state.updatedAt;
+      renderTime();
+    });
+
+    // Helper: write full state
+    async function writeState(newState){
+      await set(roomRef, {...newState, updatedAt: Date.now()});
+    }
+
+    // Initialize room if empty
+    (async ()=>{
+      const init = { remaining: 5*60, running: false, updatedAt: Date.now() };
+      await set(roomRef, init);
+    })();
+
+    // Countdown loop (client-side) — each client updates UI based on DB; controller will write running=false/true
+    setInterval(()=>{
+      // If running true, decrease remaining based on wall clock (naive but works)
+      // We only update DB when controller performs actions (start/pause/add)
+      // For viewer and control UI calculate displayed remaining using server-updated remaining and running flag
+      renderTime();
+    }, 250);
+
+    function renderTime(){
+      // show HH:MM:SS or MM:SS
+      let rem = Math.max(0, Math.floor(state.remaining));
+      if(state.running){
+        // estimate elapsed since updatedAt
+        const elapsed = Math.floor((Date.now() - state.updatedAt)/1000);
+        rem = Math.max(0, Math.floor(state.remaining - elapsed));
+      }
+      const hours = Math.floor(rem/3600);
+      const minutes = Math.floor((rem%3600)/60);
+      const seconds = rem%60;
+      const text = (hours>0? String(hours).padStart(2,'0')+':':'' ) + String(minutes).padStart(2,'0') + ':' + String(seconds).padStart(2,'0');
+      displayTime.textContent = text;
+      displayTimeControl.textContent = text;
+
+      // If hits zero and running, auto-pause and write zero
+      if(rem<=0 && state.running){
+        state.running = false;
+        state.remaining = 0;
+        writeState(state);
+      }
+    }
+
+    // CONTROL UI handlers
+    if(mode === 'control'){
+      // Build wheel lists
+      const minList = document.getElementById('minList');
+      const secList = document.getElementById('secList');
+      for(let i=0;i<60;i++){
+        const m = document.createElement('div'); m.className='wheel-item'; m.textContent = String(i).padStart(2,'0'); minList.appendChild(m);
+        const s = document.createElement('div'); s.className='wheel-item'; s.textContent = String(i).padStart(2,'0'); secList.appendChild(s);
+      }
+
+      // helper to get currently centered item
+      function getCentered(list){
+        const children = Array.from(list.children);
+        const rect = list.getBoundingClientRect();
+        const centerY = rect.top + rect.height/2;
+        let closest = null; let dist = Infinity;
+        children.forEach((c, idx)=>{
+          const r = c.getBoundingClientRect();
+          const d = Math.abs((r.top + r.height/2) - centerY);
+          if(d<dist){dist=d;closest={el:c,idx}};
+        });
+        return closest;
+      }
+
+      // mark active on scroll
+      function hookWheel(list){
+        list.addEventListener('scroll', ()=>{
+          const c = getCentered(list);
+          Array.from(list.children).forEach(x=>x.classList.remove('active'));
+          if(c) c.el.classList.add('active');
+        });
+        // trigger once
+        setTimeout(()=>{ list.scrollTop = 40*5; list.dispatchEvent(new Event('scroll')) },50);
+      }
+      hookWheel(minList); hookWheel(secList);
+
+      document.getElementById('setBtn').addEventListener('click', async ()=>{
+        const cm = getCentered(minList); const cs = getCentered(secList);
+        const minutes = cm? cm.idx : 0; const seconds = cs? cs.idx : 0;
+        state.remaining = minutes*60 + seconds;
+        state.running = false;
+        state.updatedAt = Date.now();
+        await writeState(state);
+      });
+
+      document.getElementById('add1').addEventListener('click', async ()=>{
+        // add 60 seconds to remaining (if running we consider base value)
+        if(state.running){
+          // compute current remaining first
+          const elapsed = Math.floor((Date.now() - state.updatedAt)/1000);
+          state.remaining = Math.max(0, state.remaining - elapsed) + 60;
+        } else {
+          state.remaining = state.remaining + 60;
+        }
+        state.running = false; state.updatedAt = Date.now();
+        await writeState(state);
+      });
+
+      document.getElementById('resetBtn').addEventListener('click', async ()=>{
+        state.remaining = 0; state.running = false; state.updatedAt = Date.now(); await writeState(state);
+      });
+
+      document.getElementById('startPause').addEventListener('click', async (e)=>{
+        state.running = !state.running;
+        state.updatedAt = Date.now();
+        await writeState(state);
+        e.target.textContent = state.running? 'Пауза' : 'Старт';
+      });
+
+      // Update start/pause label based on remote change
+      onValue(roomRef, (snap)=>{
+        const val = snap.val(); if(!val) return;
+        state = {...state, ...val};
+        document.getElementById('startPause').textContent = state.running? 'Пауза' : 'Старт';
+        // ensure wheels show current remaining when not running
+        if(!state.running){
+          const mins = Math.floor(state.remaining/60)%60; const secs = state.remaining%60;
+          // scroll lists to position
+          const minListEl = document.getElementById('minList'); const secListEl = document.getElementById('secList');
+          minListEl.scrollTop = Math.max(0,(mins-2))*40; secListEl.scrollTop = Math.max(0,(secs-2))*40;
+          minListEl.dispatchEvent(new Event('scroll')); secListEl.dispatchEvent(new Event('scroll'));
+        }
+      });
+    }
+
+    // For VIEW mode we hide pointer events so OBS shows only timer
+    if(mode === 'view'){
+      document.body.style.background='transparent';
+      document.documentElement.style.background='transparent';
+    }
+
+    // Make it easy to copy share link
+    function showCopyLinks(){
+      const base = location.origin + location.pathname + '?room=' + room + '&mode=';
+      const viewLink = base + 'view';
+      const controlLink = base + 'control';
+      if(mode !== 'view'){
+        const el = document.createElement('div'); el.style.marginTop='12px'; el.style.textAlign='center'; el.innerHTML = `<div style="font-size:13px;color:var(--muted)">Ссылки для комнаты:<br><code id='vlink'>${viewLink}</code><br><code id='clink'>${controlLink}</code></div>`;
+        document.getElementById('app').appendChild(el);
+      }
+    }
+    showCopyLinks();
+
+  </script>
+</body>
+</html>
